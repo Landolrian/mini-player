@@ -353,6 +353,8 @@ final class PlayerModel: ObservableObject {
     private var userQueued: [String] = [] { didSet { UserDefaults.standard.set(userQueued, forKey: "userQueued") } }
     private var queuedAsin: [String: String] = [:] { didSet { UserDefaults.standard.set(queuedAsin, forKey: "queuedAsin") } }
     var wantsRoomForList: ((Bool) -> Void)?
+    var wantsOriginalSize: (() -> Void)?
+    private var showListBeforeDiscover: Bool?
     private var lastSig = 0
     private var lastCur = -1
     private var lastTitle = ""
@@ -617,12 +619,21 @@ final class PlayerModel: ObservableObject {
     }
 
     func toggleList() {
-        if showDiscover { showDiscover = false; showList = true } else { showList.toggle() }
+        if showDiscover { showDiscover = false; showList = true; showListBeforeDiscover = nil } else { showList.toggle() }
         wantsRoomForList?(showList)
     }
 
+    /// Closes "Find new music" and puts the window back to the size it had before it grew for it.
+    func closeDiscover() {
+        guard showDiscover else { return }
+        showDiscover = false
+        if let before = showListBeforeDiscover { showList = before; showListBeforeDiscover = nil }
+        wantsOriginalSize?()
+    }
+
     func toggleDiscover() {
-        if showDiscover { showDiscover = false; return }
+        if showDiscover { closeDiscover(); return }
+        if showListBeforeDiscover == nil { showListBeforeDiscover = showList }
         showList = true
         wantsRoomForList?(true)
         if suggestions.isEmpty { findNewMusic() } else { showDiscover = true }
@@ -734,6 +745,7 @@ final class PlayerModel: ObservableObject {
 
     func findNewMusic() {
         guard !discovering else { return }
+        if !showDiscover && showListBeforeDiscover == nil { showListBeforeDiscover = showList }
         showDiscover = true
         showList = true
         wantsRoomForList?(true)
@@ -1587,7 +1599,7 @@ struct DiscoverView: View {
                         .opacity(m.discovering ? 0.5 : 1)
                 }
                 .buttonStyle(.plain).disabled(m.discovering)
-                IconButton(symbol: "xmark.circle.fill", size: 12 * u, color: p.sub, activeColor: p.accent, help: "Back to playlist") { m.showDiscover = false }
+                IconButton(symbol: "xmark.circle.fill", size: 12 * u, color: p.sub, activeColor: p.accent, help: "Close") { m.closeDiscover() }
             }
             .padding(.horizontal, 12 * u).padding(.vertical, 7 * u)
             ScrollView {
@@ -1833,6 +1845,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         model.$pinned.sink { [weak self] in self?.applyPin($0) }.store(in: &bag)
         model.wantsRoomForList = { [weak self] show in self?.makeRoom(forList: show) }
+        model.wantsOriginalSize = { [weak self] in self?.restoreOriginalSize() }
         if let dir = ProcessInfo.processInfo.environment["MINIPLAYER_TEST_DIR"] { startTestHarness(dir) }
     }
 
@@ -1872,7 +1885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "addpl":
             let name = a.dropFirst().joined(separator: " ")
             if let pl = m.playlists.first(where: { $0.title.caseInsensitiveCompare(name) == .orderedSame }) { m.addToPlaylist(.current, pl) }
-        case "back": m.showDiscover = false
+        case "back": m.closeDiscover()
         case "use": if n < m.suggestions.count { m.use(m.suggestions[n], a[2] == "play" ? .play : a[2] == "next" ? .next : .queue) }
         case "theme": if let t = Theme.presets.first(where: { $0.name == a[1] }) { m.theme = t }
         case "opacity": m.theme.opacity = Double(a[1]) ?? 1
@@ -1898,6 +1911,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Grows the window when the playlist is turned on but there's no room for it, and shrinks it when turned off.
+    private var frameBeforeGrow: NSRect?   // window spot + size before it grew to show a list
+    private var grownFrame: NSRect?
+
     func makeRoom(forList show: Bool) {
         guard let panel else { return }
         let content = panel.contentRect(forFrameRect: panel.frame)
@@ -1905,8 +1921,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let target: CGFloat
         if show {
             guard content.height < 235 * u else { return }
+            frameBeforeGrow = panel.frame
             target = 480 * u
         } else {
+            if frameBeforeGrow != nil { restoreOriginalSize(); return }
             guard content.height > 140 * u else { return }
             target = 116 * u
         }
@@ -1914,6 +1932,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let vis = panel.screen?.visibleFrame, r.minY < vis.minY {
             r.origin.y = vis.minY
             r.size.height = min(r.height, vis.height)
+        }
+        panel.setFrame(r, display: true, animate: true)
+        if show { grownFrame = panel.frame }
+    }
+
+    /// Back to the size from before the window grew — unless you've resized it yourself since.
+    func restoreOriginalSize() {
+        guard let panel, let before = frameBeforeGrow, let grown = grownFrame else { frameBeforeGrow = nil; grownFrame = nil; return }
+        defer { frameBeforeGrow = nil; grownFrame = nil }
+        let now = panel.frame
+        let close: (CGFloat, CGFloat) -> Bool = { abs($0 - $1) <= 2 }
+        guard close(now.width, grown.width), close(now.height, grown.height) else { return }   // you resized it yourself: keep yours
+        var r = before
+        if !(close(now.minX, grown.minX) && close(now.minY, grown.minY)) {
+            // you moved it: keep it where you put it (same top-left corner), just shrink it back
+            r = NSRect(x: now.minX, y: now.maxY - before.height, width: before.width, height: before.height)
         }
         panel.setFrame(r, display: true, animate: true)
     }
