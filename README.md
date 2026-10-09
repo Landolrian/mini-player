@@ -13,7 +13,7 @@ A small, always-on-top player for the **Amazon Music desktop app** on macOS. Pin
 - **Your queue** — scroll through the playlist you're listening to and click any song to play it.
   - **Play next** puts a song right after the current one.
   - **Add to queue** lines songs up in the order you add them (#1, #2, #3…), instead of dumping them at the end.
-- **Find new music** ✨ — suggests songs that *aren't* in your playlist yet, based on the artists in it, with a short reason for each pick. Play, play next, or queue them right from the list.
+- **Find new music** ✨ — suggests songs that *aren't* in your playlist yet, with a short reason for each pick. Play, play next, or queue them right from the list. (How it picks: Mini Player has a built-in map of which artists sound alike, across lots of genres. It looks at the artists in what you're playing, picks related artists you don't have yet, and finds their songs through Amazon Music's own search. If your playlist's artists aren't in the map, it suggests other songs by the artists you already have. No AI service, account, or internet beyond Amazon Music is involved.)
 - **Add to playlist** ➕ — add the current song (or any song, by right-clicking) to one of your playlists. Already in there? It tells you instead of adding a duplicate.
 - **Optional "master" playlist** — choose one playlist that every added song also goes into (right-click → *Also add every song to…*).
 

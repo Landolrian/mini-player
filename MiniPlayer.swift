@@ -159,14 +159,16 @@ actor CDP {
 }
 
 // The helper script placed inside the Amazon Music page. It only talks to the page's own player.
-let helperVersion = 8
+let helperVersion = 9
 let helperJS = #"""
 (()=>{
-if(window.__mp&&window.__mp.v===8)return "ready";
+if(window.__mp&&window.__mp.v===9)return "ready";
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 if(!window.__mpReq){const id="__mp"+Date.now();webpackJsonp.push([[],{[id]:(m,e,r)=>{window.__mpReq=r}},[[id]]]);}
 const bus=window.__mpReq("6586").a;
-const mp={v:8,_found:{},_last:0,master:""};
+// Nothing in here may wait on page timers: Amazon Music freezes them while its window is hidden.
+// Slow things are split into a "start" call and a "poll" call; the mini player does the waiting.
+const mp={v:9,_found:{},_last:0,master:"",_pl:null};
 // Optional: every song added to any playlist also goes into one "master" playlist, skipping songs already there.
 if(!bus.__mpOrig){
   bus.__mpOrig=bus.execute;
@@ -182,7 +184,7 @@ const toSel=tr=>tr.asin?{type:"track",uniqueId:tr.asin,libraryId:"",context:"pri
   :{type:"track",uniqueId:tr.uniqueId||tr.id,libraryId:tr.libraryId||tr.id||"",context:"library",isOwned:!!tr.isOwned};
 const appendP=(pid,sels,force,view)=>new Promise(res=>{
   const to=setTimeout(()=>res("timeout"),12000);
-  const done=v=>{clearTimeout(to);mp._plAt=0;res(v)};
+  const done=v=>{clearTimeout(to);res(v)};
   try{exec("Library.appendTracksToPlaylist",pid,sels,!force,!force,view||(sels[0]&&sels[0].context)||"prime",()=>done("added"),()=>done("error"),()=>done("duplicate"))}
   catch(e){done("error")}
 });
@@ -206,8 +208,7 @@ mp.state=()=>{
       repeat:s.repeatSettings||"NONE",cur:q.currentPlayableIndex,n:L.length,sig:h,cont:cp&&cp.containerInfo?cp.containerInfo.containerName:""});
   }catch(e){return "NOSTATE"}
 };
-mp.queue=async()=>{
-  mp.refresh();await sleep(400);
+mp.queue=()=>{
   return JSON.stringify(items().map(x=>({u:x.track.uniqueId,t:x.track.title,a:x.track.artist?x.track.artist.name:"",
     al:x.track.album?x.track.album.name:"",d:x.track.duration||0,img:x.track.album?(x.track.album.image||""):"",asin:x.track.asin||""})));
 };
@@ -215,39 +216,49 @@ mp.click=q=>{const b=document.querySelector("[data-qaid="+q+"]");if(b){b.click()
 mp.playIndex=i=>{bus.execute("Player.changePlayingTrack",i);return true};
 mp.moveAfter=(uids,anchor)=>{bus.execute("Player.reorderPlayables",uids,anchor);return true};
 mp.remove=uids=>{bus.execute("Player.removeFromPlayQueue",uids);return true};
-mp.search=async(kw)=>{
-  const v=bus.execute("Library.getSearchResults",{keyword:kw,allowCorrection:true});
-  const t0=Date.now();
-  const get=()=>v.prime&&v.prime.sections&&v.prime.sections.find(s=>s.type==="track");
-  while(!(get()&&get().items&&get().items.length)&&Date.now()-t0<8000)await sleep(80);
-  const sec=get(),out=[];
+mp.searchStart=(kw)=>{
+  if(mp._sv){try{bus.execute("Library.release",mp._sv._id)}catch(e){}}
+  mp._sv=bus.execute("Library.getSearchResults",{keyword:kw,allowCorrection:true});mp._svAt=Date.now();
+  return "started";
+};
+mp.searchPoll=()=>{
+  const v=mp._sv;if(!v)return "[]";
+  const sec=v.prime&&v.prime.sections&&v.prime.sections.find(s=>s.type==="track");
+  if(!(sec&&sec.items&&sec.items.length)&&Date.now()-mp._svAt<8000)return "WAIT";
+  const out=[];
   if(sec&&sec.items){for(const it of sec.items.slice(0,20)){
     const c=JSON.parse(JSON.stringify(it));mp._found[c.asin]=c;
     out.push({asin:c.asin,t:c.title,a:c.artist?c.artist.name:"",d:+c.duration||0,img:c.image||(c.album&&c.album.image)||"",
       al:c.album?(c.album.name||c.album.title||""):"",rd:+c.originalReleaseDate||0});}}
   try{bus.execute("Library.release",v._id)}catch(e){}
+  mp._sv=null;
   return JSON.stringify(out);
 };
-mp.insertFound=async(asin)=>{
-  const tr=mp._found[asin];if(!tr)return JSON.stringify({err:"gone"});
-  const before=new Set(items().map(x=>x.track.uniqueId));
+mp.insertStart=(asin)=>{
+  const tr=mp._found[asin];if(!tr)return "gone";
+  mp._before=new Set(items().map(x=>x.track.uniqueId));mp._insAt=Date.now();
   const cur=pq().currentPlayableIndex,ci=JSON.parse(JSON.stringify(items()[cur].containerInfo));
   bus.execute("Player.insertNext",[tr],ci,{});
-  for(let i=0;i<30;i++){await sleep(150);mp.refresh();await sleep(150);
-    const L=items(),idx=L.findIndex(x=>!before.has(x.track.uniqueId));
-    if(idx>=0)return JSON.stringify({u:L[idx].track.uniqueId,idx});}
-  return JSON.stringify({err:"timeout"});
+  return "started";
 };
-mp.playlists=async()=>{
-  if(mp._pl&&Date.now()-mp._plAt<60000)return mp._pl;
-  const a=bus.execute("Library.getPlaylists"),t0=Date.now();
-  while(!(a.playlists&&a.playlists.user)&&Date.now()-t0<6000)await sleep(100);
-  const u=(a.playlists&&a.playlists.user)||[];
-  const out=JSON.stringify(u.map(p=>({id:p.id,t:p.title||"",n:p.totalTrackCount||0,img:typeof p.image==="string"?p.image:""})));
+mp.insertPoll=()=>{
+  mp.refresh();
+  const L=items(),idx=L.findIndex(x=>!mp._before.has(x.track.uniqueId));
+  if(idx>=0)return JSON.stringify({u:L[idx].track.uniqueId,idx});
+  return Date.now()-mp._insAt<9000?"WAIT":JSON.stringify({err:"timeout"});
+};
+const findMaster=()=>{
+  if(!mp.master||!mp._pl)return;
+  const mm=mp._pl.find(p=>(p.t||"").toLowerCase().replace(/[^a-z0-9]/g,"")===mp.master);mp.masterId=mm?mm.id:null;
+};
+mp.playlistsPoll=(fresh)=>{
+  if(fresh||!mp._plv){if(mp._plv){try{bus.execute("Library.release",mp._plv._id)}catch(e){}}mp._plv=bus.execute("Library.getPlaylists");mp._plvAt=Date.now()}
+  const a=mp._plv,u=a&&a.playlists&&a.playlists.user;
+  if(!u)return Date.now()-mp._plvAt<8000?"WAIT":"[]";
+  mp._pl=u.map(p=>({id:p.id,t:p.title||"",n:p.totalTrackCount||0,img:typeof p.image==="string"?p.image:""}));
   try{bus.execute("Library.release",a._id)}catch(e){}
-  if(u.length){mp._pl=out;mp._plAt=Date.now()}
-  if(mp.master){const mm=u.find(p=>(p.title||"").toLowerCase().replace(/[^a-z0-9]/g,"")===mp.master);mp.masterId=mm?mm.id:null}
-  return out;
+  mp._plv=null;findMaster();
+  return JSON.stringify(mp._pl);
 };
 mp.addToPlaylist=async(pid,kind,key,force)=>{
   let tr=null;
@@ -255,16 +266,15 @@ mp.addToPlaylist=async(pid,kind,key,force)=>{
   else if(kind==="queue"){const it=items().find(x=>x.track.uniqueId===key);tr=it&&it.track}
   else{tr=mp._found[key]}
   if(!tr)return JSON.stringify({t:"missing",m:"none"});
-  if(mp.master&&!mp.masterId)await mp.playlists();
+  findMaster();
   const sel=toSel(JSON.parse(JSON.stringify(tr)));
   const t=await appendP(pid,[sel],force);
   let m="none";
   if(mp.masterId&&mp.masterId!==pid)m=await appendP(mp.masterId,[sel],false);
   return JSON.stringify({t,m});
 };
-mp.setMaster=async(name)=>{
-  mp.master=(name||"").toLowerCase().replace(/[^a-z0-9]/g,"");mp.masterId=null;
-  if(mp.master){mp._plAt=0;await mp.playlists()}
+mp.setMaster=(name)=>{
+  mp.master=(name||"").toLowerCase().replace(/[^a-z0-9]/g,"");mp.masterId=null;findMaster();
   return mp.masterId||"";
 };
 window.__mp=mp;mp.refresh();
@@ -397,7 +407,8 @@ final class PlayerModel: ObservableObject {
     func launchAmazon() {
         guard let url = amazonURL else { return }
         let cfg = NSWorkspace.OpenConfiguration()
-        cfg.arguments = ["--remote-debugging-port=9333"]
+        cfg.arguments = ["--remote-debugging-port=9333", "--disable-background-timer-throttling",
+                         "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows"]
         cfg.activates = false
         NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in }
     }
@@ -497,7 +508,20 @@ final class PlayerModel: ObservableObject {
         }
     }
 
+    /// Asks the page again every 120 ms until it has an answer (the page can't wait on its own timers while hidden).
+    private func poll(_ js: String, every ms: UInt64 = 120, upTo seconds: Double = 10) async -> String? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            guard let r = try? await str(js, timeout: 6) else { return nil }
+            if r != "WAIT" { return r }
+            try? await Task.sleep(nanoseconds: ms * 1_000_000)
+        }
+        return nil
+    }
+
     func fetchQueue() async {
+        _ = try? await cdp.eval("window.__mp.refresh()", timeout: 6)
+        try? await Task.sleep(nanoseconds: 400_000_000)
         guard let raw = try? await str("window.__mp.queue()", timeout: 10),
               let data = raw.data(using: .utf8),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return }
@@ -625,6 +649,7 @@ final class PlayerModel: ObservableObject {
     func isRecent(_ p: PlaylistInfo) -> Bool { recentPlaylists.prefix(3).contains(p.id) }
 
     func pushMaster() async {
+        if !masterPlaylist.isEmpty { await loadPlaylists() }
         let esc = masterPlaylist.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
         _ = try? await cdp.eval("window.__mp&&window.__mp.setMaster('\(esc)')", timeout: 10)
     }
@@ -632,7 +657,8 @@ final class PlayerModel: ObservableObject {
     func openTip() { NSWorkspace.shared.open(Self.tipURL) }
 
     func loadPlaylists() async {
-        guard let raw = try? await str("window.__mp.playlists()", timeout: 12),
+        _ = try? await str("window.__mp.playlistsPoll(true)", timeout: 6)
+        guard let raw = await poll("window.__mp.playlistsPoll(false)", upTo: 10),
               let data = raw.data(using: .utf8),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]], !arr.isEmpty else { return }
         let list = arr.map { PlaylistInfo(id: $0["id"] as? String ?? "", title: $0["t"] as? String ?? "",
@@ -693,7 +719,8 @@ final class PlayerModel: ObservableObject {
 
     private func searchSongs(_ keyword: String) async -> [Found] {
         let esc = keyword.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'")
-        guard let raw = try? await str("window.__mp.search('\(esc)')", timeout: 15),
+        _ = try? await str("window.__mp.searchStart('\(esc)')", timeout: 6)
+        guard let raw = await poll("window.__mp.searchPoll()", upTo: 10),
               let data = raw.data(using: .utf8),
               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         return arr.map {
@@ -804,7 +831,8 @@ final class PlayerModel: ObservableObject {
         Task {
             let runBefore = lineupRun()
             let esc = s.id.replacingOccurrences(of: "'", with: "\\'")
-            guard let raw = try? await str("window.__mp.insertFound('\(esc)')", timeout: 15),
+            guard (try? await str("window.__mp.insertStart('\(esc)')", timeout: 6)) == "started",
+                  let raw = await poll("window.__mp.insertPoll()", every: 200, upTo: 11),
                   let data = raw.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let uid = o["u"] as? String, let idx = o["idx"] as? Int else {
